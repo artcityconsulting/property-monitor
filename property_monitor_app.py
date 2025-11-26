@@ -131,6 +131,7 @@ def init_database():
         ('zoho_token_expiry', ''),
         ('zoho_module', ''),
         ('zoho_field_mapping', ''),
+        ('zoho_match_field', ''),  # Which Zoho field contains MLS# for matching
         ('zoho_connected', 'false'),
         ('zoho_sync_enabled', 'false'),
         ('zoho_last_sync', ''),
@@ -814,7 +815,7 @@ def get_field_mapping():
         return None
 
 def sync_to_zoho_crm():
-    """Sync properties to Zoho"""
+    """Sync properties to Zoho - UPDATE ONLY (no creates)"""
     access_token = get_zoho_access_token()
     
     if not access_token:
@@ -828,12 +829,19 @@ def sync_to_zoho_crm():
     module = mapping_data['module']
     mapping = mapping_data['mapping']
     
+    # Get MLS match field for searching
+    match_field = get_setting('zoho_match_field', '')
+    
+    if not match_field:
+        return {'success': False, 'error': 'No MLS match field configured'}
+    
     df = get_all_properties()
     
     if df.empty:
-        return {'success': True, 'synced': 0, 'message': 'No properties to sync'}
+        return {'success': True, 'updated': 0, 'skipped': 0, 'message': 'No properties to sync'}
     
-    synced = 0
+    updated = 0
+    skipped = 0
     errors = []
     
     headers = {
@@ -841,8 +849,9 @@ def sync_to_zoho_crm():
         'Content-Type': 'application/json'
     }
     
-    for _, row in df.iterrows():
+    for idx, row in df.iterrows():
         try:
+            # Build record data from field mapping
             record_data = {}
             
             for prop_field, zoho_field in mapping.items():
@@ -855,34 +864,88 @@ def sync_to_zoho_crm():
                         
                         record_data[zoho_field] = value
             
-            if row['zoho_id']:
-                url = f"{CONFIG['ZOHO_API_BASE']}/{module}/{row['zoho_id']}"
-                response = requests.put(url, headers=headers, json={'data': [record_data]})
-            else:
-                url = f"{CONFIG['ZOHO_API_BASE']}/{module}"
-                response = requests.post(url, headers=headers, json={'data': [record_data]})
-                
-                if response.status_code == 201:
-                    zoho_id = response.json()['data'][0]['details']['id']
-                    conn = sqlite3.connect(DB_PATH)
-                    cursor = conn.cursor()
-                    cursor.execute("UPDATE properties SET zoho_id = ? WHERE id = ?", (zoho_id, row['id']))
-                    conn.commit()
-                    conn.close()
+            zoho_id = row['zoho_id']
+            mls_number = row['mls']
             
-            if response.status_code in [200, 201]:
-                synced += 1
+            # Strategy 1: Try to update by zoho_id if we have it
+            if zoho_id and zoho_id != '':
+                try:
+                    url = f"{CONFIG['ZOHO_API_BASE']}/{module}/{zoho_id}"
+                    response = requests.put(url, headers=headers, json={'data': [record_data]}, timeout=10)
+                    
+                    if response.status_code == 200:
+                        updated += 1
+                        continue
+                    else:
+                        # zoho_id might be invalid, try MLS search next
+                        pass
+                except:
+                    pass
+            
+            # Strategy 2: Search for record by MLS# in the match field
+            if mls_number and mls_number != '':
+                try:
+                    # Search Zoho for record with this MLS#
+                    search_url = f"{CONFIG['ZOHO_API_BASE']}/{module}/search"
+                    search_params = {
+                        'criteria': f"({match_field}:equals:{mls_number})"
+                    }
+                    
+                    search_response = requests.get(search_url, headers=headers, params=search_params, timeout=10)
+                    
+                    if search_response.status_code == 200:
+                        search_data = search_response.json()
+                        
+                        if search_data.get('data') and len(search_data['data']) > 0:
+                            # Found existing record!
+                            found_record = search_data['data'][0]
+                            found_zoho_id = found_record['id']
+                            
+                            # Update the record
+                            update_url = f"{CONFIG['ZOHO_API_BASE']}/{module}/{found_zoho_id}"
+                            update_response = requests.put(update_url, headers=headers, json={'data': [record_data]}, timeout=10)
+                            
+                            if update_response.status_code == 200:
+                                # Save zoho_id to database for future syncs
+                                conn = sqlite3.connect(DB_PATH)
+                                cursor = conn.cursor()
+                                cursor.execute("UPDATE properties SET zoho_id = ? WHERE id = ?", (found_zoho_id, row['id']))
+                                conn.commit()
+                                conn.close()
+                                
+                                updated += 1
+                                continue
+                            else:
+                                errors.append(f"MLS {mls_number}: Update failed - {update_response.text}")
+                                continue
+                        else:
+                            # No record found in Zoho with this MLS#
+                            skipped += 1
+                            continue
+                    else:
+                        # Search failed
+                        errors.append(f"MLS {mls_number}: Search failed - {search_response.text}")
+                        continue
+                        
+                except Exception as e:
+                    errors.append(f"MLS {mls_number}: Search error - {str(e)}")
+                    continue
             else:
-                errors.append(f"{row['mls']}: {response.text}")
+                # No MLS# to search by
+                skipped += 1
+                errors.append(f"Property ID {row['id']}: No MLS# to match")
+                continue
                 
         except Exception as e:
-            errors.append(f"{row['mls']}: {str(e)}")
+            errors.append(f"MLS {row.get('mls', 'unknown')}: {str(e)}")
+            continue
     
     set_setting('zoho_last_sync', datetime.now().isoformat())
     
     return {
         'success': True,
-        'synced': synced,
+        'updated': updated,
+        'skipped': skipped,
         'total': len(df),
         'errors': errors
     }
@@ -1307,6 +1370,42 @@ def main():
                             # Zoho field options
                             zoho_field_options = {f"{f['display_label']} ({f['api_name']})": f['api_name'] for f in fields_result['fields']}
                             
+                            # MLS MATCH FIELD CONFIGURATION
+                            st.markdown("### 🔑 MLS Match Field")
+                            st.caption("Select which Zoho field contains the MLS# for matching records")
+                            
+                            current_match_field = get_setting('zoho_match_field', '')
+                            
+                            # Find current selection display name
+                            match_field_display = None
+                            for display, api in zoho_field_options.items():
+                                if api == current_match_field:
+                                    match_field_display = display
+                                    break
+                            
+                            selected_match_field_display = st.selectbox(
+                                "Zoho Field with MLS#",
+                                options=[''] + list(zoho_field_options.keys()),
+                                index=list(zoho_field_options.keys()).index(match_field_display) + 1 if match_field_display else 0,
+                                format_func=lambda x: 'Select MLS match field...' if x == '' else x,
+                                help="This field in Zoho should contain the MLS# to match properties. Sync will search for records by MLS# in this field."
+                            )
+                            
+                            if selected_match_field_display and selected_match_field_display != '':
+                                selected_match_field_api = zoho_field_options[selected_match_field_display]
+                                if selected_match_field_api != current_match_field:
+                                    set_setting('zoho_match_field', selected_match_field_api)
+                                    st.success(f"✅ Match field set to: {selected_match_field_display}")
+                                    time.sleep(1)
+                                    st.rerun()
+                            
+                            if current_match_field:
+                                st.info(f"📌 Matching: **zoho_id** (if exists) OR **MLS#** in `{current_match_field}`")
+                            else:
+                                st.warning("⚠️ Please select an MLS match field before syncing")
+                            
+                            st.divider()
+                            
                             # Display existing mappings
                             if st.session_state.field_mapping:
                                 st.markdown("**Current Field Mappings:**")
@@ -1397,23 +1496,33 @@ def main():
                                 st.divider()
                                 st.markdown("### Sync Properties")
                                 
-                                if st.button("🔄 Sync All Properties to Zoho CRM", type="primary"):
-                                    # Confirmation
-                                    confirm = st.button("✅ Confirm Sync", type="secondary")
-                                    
-                                    if confirm:
-                                        with st.spinner("Syncing..."):
-                                            result = sync_to_zoho_crm()
-                                            
-                                            if result.get('success'):
-                                                st.success(f"✅ Synced {result['synced']}/{result['total']} properties!")
+                                # Add info about update-only behavior
+                                st.info("ℹ️ **Update Only Mode**: Sync will only update existing Zoho records. It will NOT create new records. Properties without matching records in Zoho will be skipped.")
+                                
+                                # Check if match field is configured
+                                if not get_setting('zoho_match_field', ''):
+                                    st.error("⚠️ Please configure the MLS Match Field above before syncing!")
+                                else:
+                                    if st.button("🔄 Sync All Properties to Zoho CRM", type="primary"):
+                                        # Confirmation
+                                        confirm = st.button("✅ Confirm Sync (Update Only)", type="secondary")
+                                        
+                                        if confirm:
+                                            with st.spinner("Syncing..."):
+                                                result = sync_to_zoho_crm()
                                                 
-                                                if result.get('errors'):
-                                                    with st.expander("View Errors"):
-                                                        for error in result['errors']:
-                                                            st.text(error)
-                                            else:
-                                                st.error(f"❌ {result.get('error', 'Unknown error')}")
+                                                if result.get('success'):
+                                                    st.success(f"✅ Updated {result.get('updated', 0)}/{result.get('total', 0)} properties!")
+                                                    
+                                                    if result.get('skipped', 0) > 0:
+                                                        st.warning(f"⚠️ Skipped {result['skipped']} properties (not found in Zoho)")
+                                                    
+                                                    if result.get('errors'):
+                                                        with st.expander(f"View Errors ({len(result['errors'])})"):
+                                                            for error in result['errors']:
+                                                                st.text(error)
+                                                else:
+                                                    st.error(f"❌ {result.get('error', 'Unknown error')}")
                                 
                                 last_sync = get_setting('zoho_last_sync', '')
                                 if last_sync:
