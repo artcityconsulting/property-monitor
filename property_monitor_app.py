@@ -1,6 +1,6 @@
 """
-Utah Real Estate Property Monitor - Modern UI (V2)
-A sleek web-based property monitoring tool with auto-refresh
+Utah Real Estate Property Monitor - Modern UI (V2.1 - FIXED)
+Clean card view with expand/collapse and proper dark mode support
 """
 
 import streamlit as st
@@ -11,7 +11,6 @@ import time
 import re
 import sqlite3
 from pathlib import Path
-import json
 
 # Page configuration
 st.set_page_config(
@@ -21,64 +20,42 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for modern styling
+# Custom CSS for modern styling with dark mode support
 st.markdown("""
 <style>
     /* Hide Streamlit branding */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     
-    /* Modern card styling */
-    .property-card {
-        background: white;
-        border-radius: 12px;
-        padding: 20px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-        margin-bottom: 16px;
-        border-left: 4px solid #1f77b4;
-    }
-    
-    /* Floating action button */
-    .floating-button {
-        position: fixed;
-        bottom: 30px;
-        right: 30px;
-        z-index: 999;
-    }
-    
     /* Status badges */
     .status-badge {
         display: inline-block;
-        padding: 4px 12px;
-        border-radius: 12px;
-        font-size: 12px;
+        padding: 6px 14px;
+        border-radius: 16px;
+        font-size: 13px;
         font-weight: 600;
+        margin-bottom: 8px;
     }
     
-    .status-for-sale { background: #d4edda; color: #155724; }
-    .status-pending { background: #fff3cd; color: #856404; }
-    .status-sold { background: #f8d7da; color: #721c24; }
-    .status-off-market { background: #e2e3e5; color: #383d41; }
-    
-    /* Metric cards */
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        padding: 20px;
-        border-radius: 12px;
-        text-align: center;
+    .status-for-sale { 
+        background: #d4edda; 
+        color: #155724;
+        border: 1px solid #c3e6cb;
     }
-    
-    /* Table styling */
-    .dataframe {
-        font-size: 14px;
+    .status-pending { 
+        background: #fff3cd; 
+        color: #856404;
+        border: 1px solid #ffeaa7;
     }
-    
-    /* View toggle buttons */
-    .view-toggle {
-        display: flex;
-        gap: 8px;
-        margin-bottom: 20px;
+    .status-sold { 
+        background: #f8d7da; 
+        color: #721c24;
+        border: 1px solid #f5c6cb;
+    }
+    .status-off-market { 
+        background: #e2e3e5; 
+        color: #383d41;
+        border: 1px solid #d6d8db;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -91,7 +68,6 @@ def init_database():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Properties table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS properties (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,7 +98,6 @@ def init_database():
         )
     """)
     
-    # Settings table for auto-refresh configuration
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -130,7 +105,6 @@ def init_database():
         )
     """)
     
-    # Initialize default settings
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", 
                    ('auto_refresh_enabled', 'true'))
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", 
@@ -145,7 +119,6 @@ def init_database():
 
 init_database()
 
-# Configuration
 CONFIG = {
     'UTAH_URL_PATTERN': 'https://www.utahrealestate.com/report/',
     'ZILLOW_URL_PATTERN': 'https://www.zillow.com/homedetails/',
@@ -192,11 +165,10 @@ def should_auto_refresh():
         return True
 
 # ========================================
-# HELPER FUNCTIONS (Same as before)
+# HELPER FUNCTIONS
 # ========================================
 
 def detect_source(url):
-    """Detect which website the URL is from"""
     if 'utahrealestate.com' in url:
         return 'UtahRealEstate.com'
     elif 'zillow.com' in url:
@@ -204,7 +176,6 @@ def detect_source(url):
     return None
 
 def convert_input_to_url(input_text):
-    """Convert MLS number or URL to full URL"""
     input_text = input_text.strip()
     
     if input_text.startswith('http://') or input_text.startswith('https://'):
@@ -212,7 +183,7 @@ def convert_input_to_url(input_text):
         if source:
             return {'success': True, 'url': input_text, 'source': source}
         else:
-            return {'success': False, 'error': 'Unsupported website. Use UtahRealEstate.com or Zillow.com'}
+            return {'success': False, 'error': 'Unsupported website'}
     
     mls_match = re.match(r'^(MLS)?(\d{6,10})$', input_text, re.IGNORECASE)
     if mls_match:
@@ -224,71 +195,40 @@ def convert_input_to_url(input_text):
         }
     
     if re.match(r'\d+.*[a-zA-Z].*,', input_text):
-        return {
-            'success': False,
-            'error': 'Address detected. Please find the property URL manually.'
-        }
+        return {'success': False, 'error': 'Address detected. Find URL manually.'}
     
-    return {
-        'success': False,
-        'error': 'Invalid input. Enter a URL or MLS#.'
-    }
+    return {'success': False, 'error': 'Invalid input'}
 
 def normalize_status(status_text):
-    """Normalize status across different sources"""
     if not status_text:
         return ''
     
     status = status_text.upper().strip()
     
     status_map = {
-        'FOR_SALE': 'For Sale',
-        'ACTIVE': 'For Sale',
-        'FOR SALE': 'For Sale',
-        'OFF_MARKET': 'Off Market',
-        'OFF MARKET': 'Off Market',
-        'PENDING': 'Pending',
-        'UNDER CONTRACT': 'Pending',
-        'CONTINGENT': 'Contingent',
-        'SOLD': 'Sold',
-        'CLOSED': 'Sold',
-        'COMING_SOON': 'Coming Soon',
-        'COMING SOON': 'Coming Soon',
-        'FOR_RENT': 'For Rent',
-        'FOR RENT': 'For Rent'
+        'FOR_SALE': 'For Sale', 'ACTIVE': 'For Sale', 'FOR SALE': 'For Sale',
+        'OFF_MARKET': 'Off Market', 'OFF MARKET': 'Off Market',
+        'PENDING': 'Pending', 'UNDER CONTRACT': 'Pending', 'CONTINGENT': 'Contingent',
+        'SOLD': 'Sold', 'CLOSED': 'Sold',
+        'COMING_SOON': 'Coming Soon', 'COMING SOON': 'Coming Soon',
+        'FOR_RENT': 'For Rent', 'FOR RENT': 'For Rent'
     }
     
     return status_map.get(status, status_text)
 
 def scrape_utah_realestate(html):
-    """Scrape UtahRealEstate.com"""
     result = {
-        'success': True,
-        'status': '',
-        'price': '',
-        'beds': '',
-        'baths': '',
-        'sqft': '',
-        'address': '',
-        'mls': '',
-        'daysOnMarket': '',
-        'yearBuilt': '',
-        'type': '',
-        'agentName': '',
-        'agentPhoto': '',
-        'agentPhone': '',
-        'agentEmail': '',
-        'brokerage': '',
-        'features': ''
+        'success': True, 'status': '', 'price': '', 'beds': '', 'baths': '',
+        'sqft': '', 'address': '', 'mls': '', 'daysOnMarket': '', 'yearBuilt': '',
+        'type': '', 'agentName': '', 'agentPhoto': '', 'agentPhone': '',
+        'agentEmail': '', 'brokerage': '', 'features': ''
     }
     
     try:
-        # Price
         price_match = re.search(r'\$?([1-9]\d{2}(?:,?\d{3}){1,2}(?:,\d{3})?)', html)
         if price_match:
             result['price'] = '$' + price_match.group(1).strip()
         
-        # Address
         street_match = re.search(r'<h2[^>]*>([^<]+)</h2>', html, re.IGNORECASE)
         street_address = street_match.group(1).strip() if street_match else ''
         
@@ -302,7 +242,6 @@ def scrape_utah_realestate(html):
         elif location_data:
             result['address'] = location_data
         
-        # Agent info
         name_link_match = re.search(
             r'<a[^>]*href=["\']\/roster\/agent\.listings\.report\.public\/agentid\/\d+[^>]*>([^<]+)</a>',
             html, re.IGNORECASE
@@ -330,7 +269,6 @@ def scrape_utah_realestate(html):
         if email_match:
             result['agentEmail'] = email_match.group(1).strip()
         
-        # Brokerage
         brokerage_match = re.search(
             r'<div[^>]*class=["\'][^"\']*broker-overview-content[^"\']*["\'][^>]*>([\s\S]*?)</div>',
             html, re.IGNORECASE
@@ -340,7 +278,6 @@ def scrape_utah_realestate(html):
             if strong_match:
                 result['brokerage'] = strong_match.group(1).strip()
         
-        # Facts
         facts = {}
         facts_matches = re.finditer(
             r'<span[^>]*class=["\'][^"\']*facts-header[^"\']*["\'][^>]*>(.*?)</span>\s*["\']?([^"\'<]+)["\']?',
@@ -361,7 +298,6 @@ def scrape_utah_realestate(html):
         result['yearBuilt'] = facts.get('Year Built', '')
         result['daysOnMarket'] = facts.get('Days on URE', facts.get('Days on Market', ''))
         
-        # Beds/baths/sqft
         beds_match = re.search(r'(\d+)\s*(?:bed|bd|bedroom)', html, re.IGNORECASE)
         if beds_match:
             result['beds'] = beds_match.group(1)
@@ -377,32 +313,17 @@ def scrape_utah_realestate(html):
         return result
         
     except Exception as e:
-        return {'success': False, 'error': f'Utah RE scraping failed: {str(e)}'}
+        return {'success': False, 'error': f'Scraping failed: {str(e)}'}
 
 def scrape_zillow(html):
-    """Scrape Zillow.com"""
     result = {
-        'success': True,
-        'status': '',
-        'price': '',
-        'beds': '',
-        'baths': '',
-        'sqft': '',
-        'address': '',
-        'mls': '',
-        'daysOnMarket': '',
-        'yearBuilt': '',
-        'type': '',
-        'agentName': '',
-        'agentPhoto': '',
-        'agentPhone': '',
-        'agentEmail': '',
-        'brokerage': '',
-        'features': ''
+        'success': True, 'status': '', 'price': '', 'beds': '', 'baths': '',
+        'sqft': '', 'address': '', 'mls': '', 'daysOnMarket': '', 'yearBuilt': '',
+        'type': '', 'agentName': '', 'agentPhoto': '', 'agentPhone': '',
+        'agentEmail': '', 'brokerage': '', 'features': ''
     }
     
     try:
-        # Status
         status_patterns = [
             r'"homeStatus"\s*:\s*"([^"]+)"',
             r'<span[^>]*data-test(?:id)?=["\']?(?:listing-)?status["\']?[^>]*>([^<]+)</span>',
@@ -418,7 +339,6 @@ def scrape_zillow(html):
         if not result['status']:
             result['status'] = 'Status Not Found'
         
-        # Price
         price_patterns = [
             r'<span[^>]*data-testid=["\']price["\'][^>]*>\$?([0-9,]+)',
             r'"price"\s*:\s*([0-9]+)'
@@ -429,7 +349,6 @@ def scrape_zillow(html):
                 result['price'] = '$' + match.group(1)
                 break
         
-        # Beds/baths/sqft
         beds_match = re.search(r'"bedrooms"\s*:\s*(\d+)', html, re.IGNORECASE)
         if beds_match:
             result['beds'] = beds_match.group(1)
@@ -442,7 +361,6 @@ def scrape_zillow(html):
         if sqft_match:
             result['sqft'] = sqft_match.group(1)
         
-        # Address
         address_patterns = [
             r'<h1[^>]*>([^<]+)</h1>',
             r'"address"\s*:\s*"([^"]+)"'
@@ -453,7 +371,6 @@ def scrape_zillow(html):
                 result['address'] = match.group(1).strip()
                 break
         
-        # Other details
         year_match = re.search(r'"yearBuilt"\s*:\s*(\d{4})', html, re.IGNORECASE)
         if year_match:
             result['yearBuilt'] = year_match.group(1)
@@ -466,7 +383,6 @@ def scrape_zillow(html):
         if type_match:
             result['type'] = type_match.group(1)
         
-        # Agent info
         agent_name_match = re.search(r'"attributionInfo"[^}]*"agentName"\s*:\s*"([^"]+)"', html, re.IGNORECASE)
         if agent_name_match:
             result['agentName'] = agent_name_match.group(1).strip()
@@ -482,10 +398,9 @@ def scrape_zillow(html):
         return result
         
     except Exception as e:
-        return {'success': False, 'error': f'Zillow scraping error: {str(e)}'}
+        return {'success': False, 'error': f'Scraping error: {str(e)}'}
 
 def scrape_property(url, source):
-    """Fetch and scrape a property URL"""
     try:
         headers = {'User-Agent': CONFIG['USER_AGENT']}
         response = requests.get(url, headers=headers, timeout=10)
@@ -503,7 +418,7 @@ def scrape_property(url, source):
             return {'success': False, 'error': 'Unknown source'}
             
     except requests.exceptions.Timeout:
-        return {'success': False, 'error': 'Request timed out'}
+        return {'success': False, 'error': 'Timeout'}
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
@@ -512,7 +427,6 @@ def scrape_property(url, source):
 # ========================================
 
 def add_property(input_text):
-    """Add a property to the database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -551,14 +465,12 @@ def add_property(input_text):
     return {'success': True, 'data': scraped_data}
 
 def get_all_properties():
-    """Retrieve all properties from database"""
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query("SELECT * FROM properties ORDER BY created_at DESC", conn)
     conn.close()
     return df
 
 def delete_property(property_id):
-    """Delete a property from database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM properties WHERE id = ?", (property_id,))
@@ -566,7 +478,6 @@ def delete_property(property_id):
     conn.close()
 
 def refresh_property(property_id):
-    """Refresh a single property's data"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -575,7 +486,7 @@ def refresh_property(property_id):
     
     if not row:
         conn.close()
-        return {'success': False, 'error': 'Property not found'}
+        return {'success': False, 'error': 'Not found'}
     
     input_text, old_status = row
     
@@ -621,7 +532,6 @@ def refresh_property(property_id):
     return {'success': True, 'status_changed': status_changed}
 
 def refresh_all_properties():
-    """Refresh all properties with progress tracking"""
     df = get_all_properties()
     
     if df.empty:
@@ -640,12 +550,11 @@ def refresh_all_properties():
         if result['success'] and result.get('status_changed'):
             changes += 1
         
-        time.sleep(2)  # Rate limiting
+        time.sleep(2)
     
     progress_placeholder.empty()
     status_placeholder.empty()
     
-    # Update last refresh timestamp
     set_setting('last_refresh', datetime.now().isoformat())
     
     return {'success': True, 'count': len(df), 'changes': changes}
@@ -655,7 +564,6 @@ def refresh_all_properties():
 # ========================================
 
 def get_status_badge_class(status):
-    """Get CSS class for status badge"""
     status_lower = status.lower()
     if 'sale' in status_lower:
         return 'status-for-sale'
@@ -667,57 +575,70 @@ def get_status_badge_class(status):
         return 'status-off-market'
 
 def render_property_card(row):
-    """Render a property in card view"""
+    """Render a property with expand/collapse using Streamlit expander"""
     status_class = get_status_badge_class(row['status'])
     
-    st.markdown(f"""
-    <div class="property-card">
-        <h3>{row['address'] or row['input_text']}</h3>
-        <span class="status-badge {status_class}">{row['status']}</span>
-    </div>
-    """, unsafe_allow_html=True)
+    # Create expander with address and key info as header
+    header = f"{row['address'] or row['input_text']} • {row['price']} • {row['beds']}bd/{row['baths']}ba"
     
-    col1, col2, col3 = st.columns([2, 2, 1])
-    
-    with col1:
-        st.markdown(f"**💰 Price:** {row['price']}")
-        st.markdown(f"**🛏️ Beds/Baths:** {row['beds']} bed, {row['baths']} bath")
-        st.markdown(f"**📐 Sq Ft:** {row['sqft']}")
-        st.markdown(f"**🏷️ MLS#:** {row['mls']}")
-        st.markdown(f"**🏠 Type:** {row['property_type']}")
-    
-    with col2:
-        if row['agent_name']:
-            st.markdown(f"**👤 Agent:** {row['agent_name']}")
-            if row['agent_phone']:
-                st.markdown(f"**📞 Phone:** {row['agent_phone']}")
-            if row['agent_email']:
-                st.markdown(f"**📧 Email:** {row['agent_email']}")
-        if row['brokerage']:
-            st.markdown(f"**🏢 Brokerage:** {row['brokerage']}")
-        st.markdown(f"**🕒 Last Checked:** {row['last_checked']}")
-    
-    with col3:
-        if st.button("🔄", key=f"refresh_{row['id']}", help="Refresh this property"):
-            with st.spinner("Refreshing..."):
-                result = refresh_property(row['id'])
-                if result['success']:
-                    st.success("✅ Updated!")
-                    if result['status_changed']:
-                        st.balloons()
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.error(f"Error: {result['error']}")
+    with st.expander(header, expanded=False):
+        # Status badge
+        st.markdown(f'<span class="status-badge {status_class}">{row["status"]}</span>', 
+                   unsafe_allow_html=True)
         
-        if st.button("🗑️", key=f"delete_{row['id']}", help="Delete this property"):
-            delete_property(row['id'])
-            st.success("Deleted!")
-            time.sleep(1)
-            st.rerun()
+        # Three columns for layout
+        col1, col2, col3 = st.columns([2, 2, 1])
         
-        if row['resolved_url']:
-            st.markdown(f"[🔗 View]({row['resolved_url']})")
+        with col1:
+            st.markdown("### 🏠 Property Details")
+            st.write(f"**💰 Price:** {row['price']}")
+            st.write(f"**🛏️ Beds:** {row['beds']}")
+            st.write(f"**🚿 Baths:** {row['baths']}")
+            st.write(f"**📐 Sq Ft:** {row['sqft']}")
+            st.write(f"**🏷️ MLS#:** {row['mls']}")
+            st.write(f"**🏠 Type:** {row['property_type']}")
+            st.write(f"**📅 Year Built:** {row['year_built']}")
+            st.write(f"**📆 Days on Market:** {row['days_on_market']}")
+        
+        with col2:
+            if row['agent_name']:
+                st.markdown("### 👤 Agent Info")
+                st.write(f"**Name:** {row['agent_name']}")
+                if row['agent_phone']:
+                    st.write(f"**📞 Phone:** {row['agent_phone']}")
+                if row['agent_email']:
+                    st.write(f"**📧 Email:** {row['agent_email']}")
+                if row['brokerage']:
+                    st.write(f"**🏢 Brokerage:** {row['brokerage']}")
+            
+            st.markdown("### ℹ️ Info")
+            st.write(f"**Source:** {row['source']}")
+            if row['last_checked']:
+                st.write(f"**Last Checked:** {row['last_checked']}")
+        
+        with col3:
+            st.markdown("### Actions")
+            
+            if st.button("🔄 Refresh", key=f"refresh_{row['id']}", use_container_width=True):
+                with st.spinner("Refreshing..."):
+                    result = refresh_property(row['id'])
+                    if result['success']:
+                        st.success("✅ Updated!")
+                        if result['status_changed']:
+                            st.balloons()
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error(f"Error: {result['error']}")
+            
+            if st.button("🗑️ Delete", key=f"delete_{row['id']}", use_container_width=True):
+                delete_property(row['id'])
+                st.success("Deleted!")
+                time.sleep(1)
+                st.rerun()
+            
+            if row['resolved_url']:
+                st.link_button("🔗 View Listing", row['resolved_url'], use_container_width=True)
 
 # ========================================
 # MAIN APP
@@ -732,7 +653,7 @@ def main():
         
         st.divider()
         
-        # Quick Add Form in Sidebar
+        # Quick Add Form
         with st.expander("➕ Quick Add Property", expanded=False):
             with st.form("quick_add_form", clear_on_submit=True):
                 property_input = st.text_input("URL or MLS#", placeholder="e.g., 2053078")
@@ -748,9 +669,9 @@ def main():
                         else:
                             st.error(result['error'])
     
-    # Main Content Area
+    # Main Content
     if page == "📊 Dashboard":
-        # Check if auto-refresh should run on app open
+        # Auto-refresh on app open
         if 'app_loaded' not in st.session_state:
             st.session_state.app_loaded = True
             
@@ -761,7 +682,7 @@ def main():
                     result = refresh_all_properties()
                     if result['success']:
                         if result['changes'] > 0:
-                            st.success(f"✅ Auto-refresh complete! {result['changes']} status change(s) detected.")
+                            st.success(f"✅ Auto-refresh complete! {result['changes']} status change(s).")
                         else:
                             st.success(f"✅ Auto-refresh complete! All {result['count']} properties up to date.")
                         st.rerun()
@@ -771,7 +692,7 @@ def main():
         df = get_all_properties()
         
         if df.empty:
-            st.info("👋 No properties yet. Use the '➕ Quick Add Property' in the sidebar to get started!")
+            st.info("👋 No properties yet. Use '➕ Quick Add Property' in the sidebar!")
         else:
             # Stats
             col1, col2, col3, col4 = st.columns(4)
@@ -789,7 +710,7 @@ def main():
             
             st.divider()
             
-            # View Toggle
+            # View Toggle and Refresh
             col1, col2, col3 = st.columns([1, 1, 4])
             with col1:
                 if st.button("📇 Card View", use_container_width=True, 
@@ -806,7 +727,7 @@ def main():
                     result = refresh_all_properties()
                     if result['success']:
                         if result['changes'] > 0:
-                            st.success(f"✅ Refreshed {result['count']} properties! {result['changes']} status change(s) detected.")
+                            st.success(f"✅ {result['count']} properties refreshed! {result['changes']} changes.")
                             st.balloons()
                         else:
                             st.success(f"✅ All {result['count']} properties up to date!")
@@ -819,7 +740,7 @@ def main():
             view_mode = get_setting('view_mode', 'cards')
             
             if view_mode == 'cards':
-                # Card View
+                # Card View with expanders
                 for _, row in df.iterrows():
                     render_property_card(row)
             else:
@@ -830,7 +751,6 @@ def main():
                     'agent_name', 'agent_phone', 'brokerage', 'last_checked'
                 ]].copy()
                 
-                # Rename columns for better display
                 display_df.columns = [
                     'Address', 'Status', 'Price', 'Beds', 'Baths', 'Sq Ft',
                     'MLS#', 'Type', 'Days on Market', 'Year Built',
@@ -848,7 +768,7 @@ def main():
                     }
                 )
                 
-                # Action buttons for table view
+                # Actions for table view
                 st.markdown("### Actions")
                 selected_ids = st.multiselect(
                     "Select properties to delete:",
@@ -892,7 +812,6 @@ def main():
         
         st.divider()
         
-        # Display last refresh info
         last_refresh = get_setting('last_refresh', '')
         if last_refresh:
             try:
@@ -910,10 +829,10 @@ def main():
         st.markdown("### Data Management")
         
         df = get_all_properties()
-        st.info(f"📊 Total properties in database: {len(df)}")
+        st.info(f"📊 Total properties: {len(df)}")
         
         if st.button("🗑️ Clear All Data", type="secondary"):
-            if st.button("⚠️ Confirm Delete All", type="secondary"):
+            if st.button("⚠️ Confirm Delete All"):
                 conn = sqlite3.connect(DB_PATH)
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM properties")
@@ -929,9 +848,9 @@ def main():
         st.markdown("""
         ### 🎯 Getting Started
         
-        1. **Add Properties**: Use the "Quick Add Property" form in the sidebar
-        2. **Monitor**: View your properties on the Dashboard
-        3. **Refresh**: Properties auto-refresh based on your settings
+        1. **Add Properties**: Use "Quick Add Property" in sidebar
+        2. **Monitor**: View properties on Dashboard
+        3. **Refresh**: Auto-refresh or manual refresh
         
         ### 📝 Supported Inputs
         
@@ -943,29 +862,16 @@ def main():
         - ✅ UtahRealEstate.com
         - ✅ Zillow.com
         
-        ### 🔄 Auto-Refresh
-        
-        The app can automatically refresh all properties when you open it:
-        
-        - Go to **Settings**
-        - Enable "Auto-Refresh on App Open"
-        - Set your preferred interval (days)
-        - Properties will auto-update based on your schedule
-        
         ### 💡 Tips
         
-        - **Card View**: Best for detailed property information
-        - **Table View**: Best for comparing multiple properties
-        - **Manual Refresh**: Click 🔄 next to any property for instant updates
-        - **Bulk Actions**: Use Table View for multi-select operations
+        - **Card View**: Click property headers to expand/collapse
+        - **Table View**: See all properties at once
+        - **Auto-Refresh**: Set in Settings to refresh on app open
+        - **Manual Refresh**: Click 🔄 for instant updates
         
-        ### 🔒 Privacy
+        ### 📱 Mobile
         
-        All data is stored locally in your SQLite database (`properties.db`)
-        
-        ### 📱 Mobile Access
-        
-        This app works great on mobile! Add it to your home screen for quick access.
+        Works great on mobile! Add to home screen for app-like experience.
         """)
 
 if __name__ == "__main__":
