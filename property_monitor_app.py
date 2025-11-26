@@ -1,6 +1,6 @@
 """
-Utah Real Estate Property Monitor - Modern UI (V2.1 - FIXED)
-Clean card view with expand/collapse and proper dark mode support
+Utah Real Estate Property Monitor - V3 (Bulk Upload + Zoho CRM)
+Features: Bulk upload, CSV import, Zoho CRM integration, improved card view
 """
 
 import streamlit as st
@@ -11,6 +11,8 @@ import time
 import re
 import sqlite3
 from pathlib import Path
+import json
+import io
 
 # Page configuration
 st.set_page_config(
@@ -20,51 +22,32 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for modern styling with dark mode support
+# Custom CSS
 st.markdown("""
 <style>
-    /* Hide Streamlit branding */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     
-    /* Status badges */
     .status-badge {
         display: inline-block;
-        padding: 6px 14px;
-        border-radius: 16px;
-        font-size: 13px;
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-size: 11px;
         font-weight: 600;
-        margin-bottom: 8px;
+        margin-left: 8px;
     }
     
-    .status-for-sale { 
-        background: #d4edda; 
-        color: #155724;
-        border: 1px solid #c3e6cb;
-    }
-    .status-pending { 
-        background: #fff3cd; 
-        color: #856404;
-        border: 1px solid #ffeaa7;
-    }
-    .status-sold { 
-        background: #f8d7da; 
-        color: #721c24;
-        border: 1px solid #f5c6cb;
-    }
-    .status-off-market { 
-        background: #e2e3e5; 
-        color: #383d41;
-        border: 1px solid #d6d8db;
-    }
+    .status-for-sale { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+    .status-pending { background: #fff3cd; color: #856404; border: 1px solid #ffeaa7; }
+    .status-sold { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+    .status-off-market { background: #e2e3e5; color: #383d41; border: 1px solid #d6d8db; }
 </style>
 """, unsafe_allow_html=True)
 
-# Database setup
 DB_PATH = Path("properties.db")
 
 def init_database():
-    """Initialize SQLite database with settings table"""
+    """Initialize database with Zoho settings table"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -94,6 +77,7 @@ def init_database():
             last_changed TIMESTAMP,
             previous_status TEXT,
             notes TEXT,
+            zoho_id TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -105,14 +89,21 @@ def init_database():
         )
     """)
     
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", 
-                   ('auto_refresh_enabled', 'true'))
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", 
-                   ('refresh_interval_days', '1'))
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", 
-                   ('last_refresh', ''))
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", 
-                   ('view_mode', 'cards'))
+    # Default settings
+    defaults = [
+        ('auto_refresh_enabled', 'true'),
+        ('refresh_interval_days', '1'),
+        ('last_refresh', ''),
+        ('view_mode', 'cards'),
+        ('zoho_client_id', ''),
+        ('zoho_client_secret', ''),
+        ('zoho_refresh_token', ''),
+        ('zoho_enabled', 'false'),
+        ('zoho_last_sync', '')
+    ]
+    
+    for key, value in defaults:
+        cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
     
     conn.commit()
     conn.close()
@@ -122,7 +113,8 @@ init_database()
 CONFIG = {
     'UTAH_URL_PATTERN': 'https://www.utahrealestate.com/report/',
     'ZILLOW_URL_PATTERN': 'https://www.zillow.com/homedetails/',
-    'USER_AGENT': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    'USER_AGENT': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'ZOHO_API_BASE': 'https://www.zohoapis.com/crm/v2'
 }
 
 # ========================================
@@ -130,7 +122,6 @@ CONFIG = {
 # ========================================
 
 def get_setting(key, default=''):
-    """Get a setting value from database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
@@ -139,7 +130,6 @@ def get_setting(key, default=''):
     return result[0] if result else default
 
 def set_setting(key, value):
-    """Set a setting value in database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
@@ -147,7 +137,6 @@ def set_setting(key, value):
     conn.close()
 
 def should_auto_refresh():
-    """Check if auto-refresh should run based on settings"""
     auto_refresh_enabled = get_setting('auto_refresh_enabled', 'true') == 'true'
     if not auto_refresh_enabled:
         return False
@@ -165,7 +154,7 @@ def should_auto_refresh():
         return True
 
 # ========================================
-# HELPER FUNCTIONS
+# SCRAPING HELPER FUNCTIONS
 # ========================================
 
 def detect_source(url):
@@ -464,6 +453,26 @@ def add_property(input_text):
     
     return {'success': True, 'data': scraped_data}
 
+def bulk_add_properties(inputs_list, progress_callback=None):
+    """Add multiple properties at once"""
+    results = {'success': 0, 'failed': 0, 'errors': []}
+    
+    for idx, input_text in enumerate(inputs_list):
+        if progress_callback:
+            progress_callback(idx + 1, len(inputs_list), input_text)
+        
+        result = add_property(input_text)
+        
+        if result['success']:
+            results['success'] += 1
+        else:
+            results['failed'] += 1
+            results['errors'].append(f"{input_text}: {result['error']}")
+        
+        time.sleep(2)  # Rate limiting
+    
+    return results
+
 def get_all_properties():
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query("SELECT * FROM properties ORDER BY created_at DESC", conn)
@@ -560,7 +569,167 @@ def refresh_all_properties():
     return {'success': True, 'count': len(df), 'changes': changes}
 
 # ========================================
-# UI HELPER FUNCTIONS
+# CSV FUNCTIONS
+# ========================================
+
+def process_csv(uploaded_file):
+    """Process uploaded CSV file"""
+    try:
+        df = pd.read_csv(uploaded_file)
+        
+        # Try to find property identifiers in various column names
+        possible_columns = ['mls', 'mls#', 'mls_number', 'url', 'link', 'property_url', 'property_link']
+        
+        property_column = None
+        for col in df.columns:
+            if col.lower().strip() in possible_columns:
+                property_column = col
+                break
+        
+        if not property_column:
+            # If no standard column found, use first column
+            property_column = df.columns[0]
+        
+        # Extract property identifiers
+        properties = df[property_column].dropna().astype(str).tolist()
+        
+        return {'success': True, 'properties': properties, 'column': property_column}
+        
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+def export_to_csv():
+    """Export all properties to CSV"""
+    df = get_all_properties()
+    
+    if df.empty:
+        return None
+    
+    # Select key columns for export
+    export_df = df[[
+        'mls', 'address', 'status', 'price', 'beds', 'baths', 'sqft',
+        'property_type', 'year_built', 'days_on_market',
+        'agent_name', 'agent_phone', 'agent_email', 'brokerage',
+        'resolved_url', 'source', 'last_checked'
+    ]]
+    
+    return export_df.to_csv(index=False)
+
+# ========================================
+# ZOHO CRM FUNCTIONS
+# ========================================
+
+def get_zoho_access_token():
+    """Get Zoho access token using refresh token"""
+    refresh_token = get_setting('zoho_refresh_token', '')
+    client_id = get_setting('zoho_client_id', '')
+    client_secret = get_setting('zoho_client_secret', '')
+    
+    if not all([refresh_token, client_id, client_secret]):
+        return None
+    
+    try:
+        url = 'https://accounts.zoho.com/oauth/v2/token'
+        data = {
+            'refresh_token': refresh_token,
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'grant_type': 'refresh_token'
+        }
+        
+        response = requests.post(url, data=data)
+        
+        if response.status_code == 200:
+            return response.json().get('access_token')
+        else:
+            return None
+            
+    except Exception as e:
+        return None
+
+def sync_to_zoho_crm():
+    """Sync properties to Zoho CRM"""
+    access_token = get_zoho_access_token()
+    
+    if not access_token:
+        return {'success': False, 'error': 'Zoho CRM not configured or authentication failed'}
+    
+    df = get_all_properties()
+    
+    if df.empty:
+        return {'success': True, 'synced': 0, 'message': 'No properties to sync'}
+    
+    synced = 0
+    errors = []
+    
+    for _, row in df.iterrows():
+        try:
+            # Map property data to Zoho CRM format
+            deal_data = {
+                'Deal_Name': row['address'] or f"Property {row['mls']}",
+                'Stage': row['status'],
+                'Amount': row['price'].replace('$', '').replace(',', '') if row['price'] else None,
+                'MLS_Number': row['mls'],
+                'Property_Address': row['address'],
+                'Bedrooms': row['beds'],
+                'Bathrooms': row['baths'],
+                'Square_Feet': row['sqft'],
+                'Property_Type': row['property_type'],
+                'Year_Built': row['year_built'],
+                'Agent_Name': row['agent_name'],
+                'Agent_Phone': row['agent_phone'],
+                'Agent_Email': row['agent_email'],
+                'Brokerage': row['brokerage'],
+                'Property_URL': row['resolved_url'],
+                'Source': row['source']
+            }
+            
+            # Remove None values
+            deal_data = {k: v for k, v in deal_data.items() if v is not None and v != ''}
+            
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            # Check if already synced
+            if row['zoho_id']:
+                # Update existing record
+                url = f"{CONFIG['ZOHO_API_BASE']}/Deals/{row['zoho_id']}"
+                response = requests.put(url, headers=headers, json={'data': [deal_data]})
+            else:
+                # Create new record
+                url = f"{CONFIG['ZOHO_API_BASE']}/Deals"
+                response = requests.post(url, headers=headers, json={'data': [deal_data]})
+                
+                if response.status_code == 201:
+                    # Save Zoho ID back to database
+                    zoho_id = response.json()['data'][0]['details']['id']
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE properties SET zoho_id = ? WHERE id = ?", (zoho_id, row['id']))
+                    conn.commit()
+                    conn.close()
+            
+            if response.status_code in [200, 201]:
+                synced += 1
+            else:
+                errors.append(f"{row['mls']}: {response.text}")
+                
+        except Exception as e:
+            errors.append(f"{row['mls']}: {str(e)}")
+    
+    set_setting('zoho_last_sync', datetime.now().isoformat())
+    
+    return {
+        'success': True,
+        'synced': synced,
+        'total': len(df),
+        'errors': errors
+    }
+
+# ========================================
+# UI FUNCTIONS
 # ========================================
 
 def get_status_badge_class(status):
@@ -575,18 +744,40 @@ def get_status_badge_class(status):
         return 'status-off-market'
 
 def render_property_card(row):
-    """Render a property with expand/collapse using Streamlit expander"""
+    """Render property card with updated collapsed view"""
     status_class = get_status_badge_class(row['status'])
     
-    # Create expander with address and key info as header
-    header = f"{row['address'] or row['input_text']} • {row['price']} • {row['beds']}bd/{row['baths']}ba"
+    # NEW: Collapsed view shows MLS#, Address, Status, Agent, Brokerage
+    header_parts = []
+    if row['mls']:
+        header_parts.append(f"MLS# {row['mls']}")
+    if row['address']:
+        header_parts.append(row['address'])
+    else:
+        header_parts.append(row['input_text'])
     
-    with st.expander(header, expanded=False):
+    header = " • ".join(header_parts)
+    
+    # Add status badge and agent/brokerage info in subheader
+    subheader_parts = []
+    if row['agent_name']:
+        subheader_parts.append(f"Agent: {row['agent_name']}")
+    if row['brokerage']:
+        subheader_parts.append(f"Brokerage: {row['brokerage']}")
+    
+    subheader = " | ".join(subheader_parts) if subheader_parts else ""
+    
+    with st.expander(f"{header}", expanded=False):
         # Status badge
         st.markdown(f'<span class="status-badge {status_class}">{row["status"]}</span>', 
                    unsafe_allow_html=True)
         
-        # Three columns for layout
+        if subheader:
+            st.caption(subheader)
+        
+        st.divider()
+        
+        # Three columns for detailed info
         col1, col2, col3 = st.columns([2, 2, 1])
         
         with col1:
@@ -595,21 +786,16 @@ def render_property_card(row):
             st.write(f"**🛏️ Beds:** {row['beds']}")
             st.write(f"**🚿 Baths:** {row['baths']}")
             st.write(f"**📐 Sq Ft:** {row['sqft']}")
-            st.write(f"**🏷️ MLS#:** {row['mls']}")
             st.write(f"**🏠 Type:** {row['property_type']}")
             st.write(f"**📅 Year Built:** {row['year_built']}")
             st.write(f"**📆 Days on Market:** {row['days_on_market']}")
         
         with col2:
-            if row['agent_name']:
-                st.markdown("### 👤 Agent Info")
-                st.write(f"**Name:** {row['agent_name']}")
-                if row['agent_phone']:
-                    st.write(f"**📞 Phone:** {row['agent_phone']}")
-                if row['agent_email']:
-                    st.write(f"**📧 Email:** {row['agent_email']}")
-                if row['brokerage']:
-                    st.write(f"**🏢 Brokerage:** {row['brokerage']}")
+            st.markdown("### 👤 Agent Info")
+            st.write(f"**Name:** {row['agent_name'] or 'N/A'}")
+            st.write(f"**📞 Phone:** {row['agent_phone'] or 'N/A'}")
+            st.write(f"**📧 Email:** {row['agent_email'] or 'N/A'}")
+            st.write(f"**🏢 Brokerage:** {row['brokerage'] or 'N/A'}")
             
             st.markdown("### ℹ️ Info")
             st.write(f"**Source:** {row['source']}")
@@ -619,11 +805,11 @@ def render_property_card(row):
         with col3:
             st.markdown("### Actions")
             
-            if st.button("🔄 Refresh", key=f"refresh_{row['id']}", use_container_width=True):
+            if st.button("🔄", key=f"refresh_{row['id']}", use_container_width=True, help="Refresh"):
                 with st.spinner("Refreshing..."):
                     result = refresh_property(row['id'])
                     if result['success']:
-                        st.success("✅ Updated!")
+                        st.success("✅")
                         if result['status_changed']:
                             st.balloons()
                         time.sleep(1)
@@ -631,14 +817,14 @@ def render_property_card(row):
                     else:
                         st.error(f"Error: {result['error']}")
             
-            if st.button("🗑️ Delete", key=f"delete_{row['id']}", use_container_width=True):
+            if st.button("🗑️", key=f"delete_{row['id']}", use_container_width=True, help="Delete"):
                 delete_property(row['id'])
                 st.success("Deleted!")
                 time.sleep(1)
                 st.rerun()
             
             if row['resolved_url']:
-                st.link_button("🔗 View Listing", row['resolved_url'], use_container_width=True)
+                st.link_button("🔗", row['resolved_url'], use_container_width=True, help="View Listing")
 
 # ========================================
 # MAIN APP
@@ -649,21 +835,22 @@ def main():
     with st.sidebar:
         st.title("🏠 Utah RE Monitor")
         
-        page = st.radio("", ["📊 Dashboard", "⚙️ Settings", "❓ Help"], label_visibility="collapsed")
+        page = st.radio("", ["📊 Dashboard", "📤 Bulk Upload", "⚙️ Settings", "❓ Help"], 
+                       label_visibility="collapsed")
         
         st.divider()
         
-        # Quick Add Form
-        with st.expander("➕ Quick Add Property", expanded=False):
+        # Quick Add
+        with st.expander("➕ Quick Add", expanded=False):
             with st.form("quick_add_form", clear_on_submit=True):
                 property_input = st.text_input("URL or MLS#", placeholder="e.g., 2053078")
-                submit = st.form_submit_button("Add Property", use_container_width=True)
+                submit = st.form_submit_button("Add", use_container_width=True)
                 
                 if submit and property_input:
-                    with st.spinner("Adding property..."):
+                    with st.spinner("Adding..."):
                         result = add_property(property_input)
                         if result['success']:
-                            st.success("✅ Added!")
+                            st.success("✅")
                             time.sleep(1)
                             st.rerun()
                         else:
@@ -671,7 +858,7 @@ def main():
     
     # Main Content
     if page == "📊 Dashboard":
-        # Auto-refresh on app open
+        # Auto-refresh check
         if 'app_loaded' not in st.session_state:
             st.session_state.app_loaded = True
             
@@ -682,17 +869,17 @@ def main():
                     result = refresh_all_properties()
                     if result['success']:
                         if result['changes'] > 0:
-                            st.success(f"✅ Auto-refresh complete! {result['changes']} status change(s).")
+                            st.success(f"✅ {result['changes']} status change(s).")
                         else:
-                            st.success(f"✅ Auto-refresh complete! All {result['count']} properties up to date.")
+                            st.success(f"✅ All {result['count']} properties up to date.")
                         st.rerun()
         
-        st.title("📊 Property Dashboard")
+        st.title("📊 Dashboard")
         
         df = get_all_properties()
         
         if df.empty:
-            st.info("👋 No properties yet. Use '➕ Quick Add Property' in the sidebar!")
+            st.info("👋 No properties. Use 'Bulk Upload' or '➕ Quick Add'!")
         else:
             # Stats
             col1, col2, col3, col4 = st.columns(4)
@@ -710,168 +897,332 @@ def main():
             
             st.divider()
             
-            # View Toggle and Refresh
-            col1, col2, col3 = st.columns([1, 1, 4])
+            # Controls
+            col1, col2, col3, col4 = st.columns([1, 1, 2, 1])
             with col1:
-                if st.button("📇 Card View", use_container_width=True, 
+                if st.button("📇 Cards", use_container_width=True, 
                            type="primary" if get_setting('view_mode', 'cards') == 'cards' else "secondary"):
                     set_setting('view_mode', 'cards')
                     st.rerun()
             with col2:
-                if st.button("📊 Table View", use_container_width=True,
+                if st.button("📊 Table", use_container_width=True,
                            type="primary" if get_setting('view_mode', 'cards') == 'table' else "secondary"):
                     set_setting('view_mode', 'table')
                     st.rerun()
             with col3:
-                if st.button("🔄 Refresh All Properties", use_container_width=True):
+                if st.button("🔄 Refresh All", use_container_width=True):
                     result = refresh_all_properties()
                     if result['success']:
                         if result['changes'] > 0:
-                            st.success(f"✅ {result['count']} properties refreshed! {result['changes']} changes.")
+                            st.success(f"✅ {result['changes']} changes detected!")
                             st.balloons()
                         else:
-                            st.success(f"✅ All {result['count']} properties up to date!")
+                            st.success("✅ All up to date!")
                         time.sleep(2)
                         st.rerun()
+            with col4:
+                csv_data = export_to_csv()
+                if csv_data:
+                    st.download_button(
+                        "📥 CSV",
+                        csv_data,
+                        "properties.csv",
+                        "text/csv",
+                        use_container_width=True
+                    )
             
             st.divider()
             
-            # Display properties
+            # Display
             view_mode = get_setting('view_mode', 'cards')
             
             if view_mode == 'cards':
-                # Card View with expanders
                 for _, row in df.iterrows():
                     render_property_card(row)
             else:
-                # Table View
                 display_df = df[[
-                    'address', 'status', 'price', 'beds', 'baths', 'sqft',
-                    'mls', 'property_type', 'days_on_market', 'year_built',
+                    'mls', 'address', 'status', 'price', 'beds', 'baths', 'sqft',
+                    'property_type', 'days_on_market', 'year_built',
                     'agent_name', 'agent_phone', 'brokerage', 'last_checked'
                 ]].copy()
                 
                 display_df.columns = [
-                    'Address', 'Status', 'Price', 'Beds', 'Baths', 'Sq Ft',
-                    'MLS#', 'Type', 'Days on Market', 'Year Built',
+                    'MLS#', 'Address', 'Status', 'Price', 'Beds', 'Baths', 'Sq Ft',
+                    'Type', 'Days on Market', 'Year Built',
                     'Agent', 'Phone', 'Brokerage', 'Last Checked'
                 ]
                 
-                st.dataframe(
-                    display_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Address": st.column_config.TextColumn("Address", width="large"),
-                        "Status": st.column_config.TextColumn("Status", width="small"),
-                        "Price": st.column_config.TextColumn("Price", width="small"),
-                    }
-                )
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
                 
-                # Actions for table view
-                st.markdown("### Actions")
                 selected_ids = st.multiselect(
-                    "Select properties to delete:",
+                    "Select to delete:",
                     options=df['id'].tolist(),
-                    format_func=lambda x: df[df['id']==x]['address'].iloc[0] or df[df['id']==x]['input_text'].iloc[0]
+                    format_func=lambda x: f"MLS# {df[df['id']==x]['mls'].iloc[0]} - {df[df['id']==x]['address'].iloc[0]}"
                 )
                 
-                if selected_ids:
-                    if st.button("🗑️ Delete Selected", type="secondary"):
-                        for prop_id in selected_ids:
-                            delete_property(prop_id)
-                        st.success(f"Deleted {len(selected_ids)} properties!")
-                        time.sleep(1)
+                if selected_ids and st.button("🗑️ Delete Selected"):
+                    for prop_id in selected_ids:
+                        delete_property(prop_id)
+                    st.success(f"Deleted {len(selected_ids)} properties!")
+                    time.sleep(1)
+                    st.rerun()
+    
+    elif page == "📤 Bulk Upload":
+        st.title("📤 Bulk Upload Properties")
+        
+        tab1, tab2 = st.tabs(["📝 Text Input", "📄 CSV Upload"])
+        
+        with tab1:
+            st.markdown("### Paste Multiple URLs or MLS Numbers")
+            st.caption("Enter one per line. Supports URLs and MLS numbers.")
+            
+            bulk_input = st.text_area(
+                "Properties",
+                height=300,
+                placeholder="2053078\nhttps://www.utahrealestate.com/report/1234567\nMLS9876543\n..."
+            )
+            
+            if st.button("🚀 Start Bulk Upload", type="primary"):
+                if not bulk_input.strip():
+                    st.error("Please enter at least one property")
+                else:
+                    inputs = [line.strip() for line in bulk_input.split('\n') if line.strip()]
+                    
+                    st.info(f"Processing {len(inputs)} properties...")
+                    
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    def progress_callback(current, total, item):
+                        progress_bar.progress(current / total)
+                        status_text.text(f"Processing {current}/{total}: {item}")
+                    
+                    results = bulk_add_properties(inputs, progress_callback)
+                    
+                    progress_bar.empty()
+                    status_text.empty()
+                    
+                    st.success(f"✅ Successfully added: {results['success']}")
+                    if results['failed'] > 0:
+                        st.error(f"❌ Failed: {results['failed']}")
+                        with st.expander("View Errors"):
+                            for error in results['errors']:
+                                st.text(error)
+                    
+                    time.sleep(2)
+                    st.rerun()
+        
+        with tab2:
+            st.markdown("### Upload CSV File")
+            st.caption("CSV should have a column with MLS numbers or URLs")
+            
+            st.markdown("""
+            **Supported column names:**
+            - `mls`, `mls#`, `mls_number`
+            - `url`, `link`, `property_url`, `property_link`
+            
+            If none found, the first column will be used.
+            """)
+            
+            uploaded_file = st.file_uploader("Choose CSV file", type=['csv'])
+            
+            if uploaded_file:
+                result = process_csv(uploaded_file)
+                
+                if result['success']:
+                    st.success(f"✅ Found {len(result['properties'])} properties in column '{result['column']}'")
+                    
+                    with st.expander("Preview"):
+                        st.write(result['properties'][:10])
+                        if len(result['properties']) > 10:
+                            st.caption(f"...and {len(result['properties']) - 10} more")
+                    
+                    if st.button("🚀 Import All", type="primary"):
+                        st.info(f"Processing {len(result['properties'])} properties...")
+                        
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        def progress_callback(current, total, item):
+                            progress_bar.progress(current / total)
+                            status_text.text(f"Processing {current}/{total}: {item}")
+                        
+                        results = bulk_add_properties(result['properties'], progress_callback)
+                        
+                        progress_bar.empty()
+                        status_text.empty()
+                        
+                        st.success(f"✅ Successfully added: {results['success']}")
+                        if results['failed'] > 0:
+                            st.error(f"❌ Failed: {results['failed']}")
+                            with st.expander("View Errors"):
+                                for error in results['errors']:
+                                    st.text(error)
+                        
+                        time.sleep(2)
                         st.rerun()
+                else:
+                    st.error(f"CSV processing failed: {result['error']}")
     
     elif page == "⚙️ Settings":
         st.title("⚙️ Settings")
         
-        st.markdown("### Auto-Refresh Configuration")
+        tab1, tab2 = st.tabs(["🔄 Auto-Refresh", "🔗 Zoho CRM"])
         
-        auto_refresh_enabled = st.toggle(
-            "Enable Auto-Refresh on App Open",
-            value=get_setting('auto_refresh_enabled', 'true') == 'true',
-            help="Automatically refresh all properties when you open the app"
-        )
-        
-        refresh_interval = st.number_input(
-            "Refresh Interval (days)",
-            min_value=1,
-            max_value=30,
-            value=int(get_setting('refresh_interval_days', '1')),
-            help="How many days between automatic refreshes"
-        )
-        
-        if st.button("💾 Save Settings", type="primary"):
-            set_setting('auto_refresh_enabled', 'true' if auto_refresh_enabled else 'false')
-            set_setting('refresh_interval_days', str(refresh_interval))
-            st.success("✅ Settings saved!")
-            time.sleep(1)
-            st.rerun()
-        
-        st.divider()
-        
-        last_refresh = get_setting('last_refresh', '')
-        if last_refresh:
-            try:
-                last_refresh_dt = datetime.fromisoformat(last_refresh)
-                st.info(f"🕒 Last auto-refresh: {last_refresh_dt.strftime('%Y-%m-%d %I:%M %p')}")
-                
-                interval_days = int(get_setting('refresh_interval_days', '1'))
-                next_refresh = last_refresh_dt + timedelta(days=interval_days)
-                st.info(f"⏭️ Next auto-refresh: {next_refresh.strftime('%Y-%m-%d %I:%M %p')}")
-            except:
-                pass
-        
-        st.divider()
-        
-        st.markdown("### Data Management")
-        
-        df = get_all_properties()
-        st.info(f"📊 Total properties: {len(df)}")
-        
-        if st.button("🗑️ Clear All Data", type="secondary"):
-            if st.button("⚠️ Confirm Delete All"):
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("DELETE FROM properties")
-                conn.commit()
-                conn.close()
-                st.success("All data cleared!")
+        with tab1:
+            st.markdown("### Auto-Refresh Configuration")
+            
+            auto_refresh_enabled = st.toggle(
+                "Enable Auto-Refresh on App Open",
+                value=get_setting('auto_refresh_enabled', 'true') == 'true'
+            )
+            
+            refresh_interval = st.number_input(
+                "Refresh Interval (days)",
+                min_value=1,
+                max_value=30,
+                value=int(get_setting('refresh_interval_days', '1'))
+            )
+            
+            if st.button("💾 Save", type="primary"):
+                set_setting('auto_refresh_enabled', 'true' if auto_refresh_enabled else 'false')
+                set_setting('refresh_interval_days', str(refresh_interval))
+                st.success("✅ Saved!")
                 time.sleep(1)
                 st.rerun()
+            
+            st.divider()
+            
+            last_refresh = get_setting('last_refresh', '')
+            if last_refresh:
+                try:
+                    last_refresh_dt = datetime.fromisoformat(last_refresh)
+                    st.info(f"🕒 Last refresh: {last_refresh_dt.strftime('%Y-%m-%d %I:%M %p')}")
+                    
+                    interval_days = int(get_setting('refresh_interval_days', '1'))
+                    next_refresh = last_refresh_dt + timedelta(days=interval_days)
+                    st.info(f"⏭️ Next refresh: {next_refresh.strftime('%Y-%m-%d %I:%M %p')}")
+                except:
+                    pass
+        
+        with tab2:
+            st.markdown("### Zoho CRM Integration")
+            
+            st.markdown("""
+            Connect to Zoho CRM to sync your properties automatically.
+            
+            **Setup Steps:**
+            1. Go to [Zoho API Console](https://api-console.zoho.com/)
+            2. Create a Server-based Application
+            3. Copy Client ID and Client Secret
+            4. Generate Refresh Token (scope: `ZohoCRM.modules.ALL`)
+            5. Paste credentials below
+            """)
+            
+            zoho_enabled = st.toggle(
+                "Enable Zoho CRM Sync",
+                value=get_setting('zoho_enabled', 'false') == 'true'
+            )
+            
+            client_id = st.text_input(
+                "Client ID",
+                value=get_setting('zoho_client_id', ''),
+                type="password"
+            )
+            
+            client_secret = st.text_input(
+                "Client Secret",
+                value=get_setting('zoho_client_secret', ''),
+                type="password"
+            )
+            
+            refresh_token = st.text_input(
+                "Refresh Token",
+                value=get_setting('zoho_refresh_token', ''),
+                type="password"
+            )
+            
+            if st.button("💾 Save Zoho Settings", type="primary"):
+                set_setting('zoho_enabled', 'true' if zoho_enabled else 'false')
+                set_setting('zoho_client_id', client_id)
+                set_setting('zoho_client_secret', client_secret)
+                set_setting('zoho_refresh_token', refresh_token)
+                st.success("✅ Zoho settings saved!")
+                time.sleep(1)
+                st.rerun()
+            
+            st.divider()
+            
+            if get_setting('zoho_enabled', 'false') == 'true':
+                st.markdown("### Sync Actions")
+                
+                if st.button("🔄 Sync All Properties to Zoho CRM", type="primary"):
+                    with st.spinner("Syncing..."):
+                        result = sync_to_zoho_crm()
+                        
+                        if result['success']:
+                            st.success(f"✅ Synced {result['synced']}/{result.get('total', 0)} properties!")
+                            
+                            if result.get('errors'):
+                                with st.expander("View Errors"):
+                                    for error in result['errors']:
+                                        st.text(error)
+                        else:
+                            st.error(f"❌ {result['error']}")
+                
+                last_sync = get_setting('zoho_last_sync', '')
+                if last_sync:
+                    try:
+                        last_sync_dt = datetime.fromisoformat(last_sync)
+                        st.info(f"🕒 Last sync: {last_sync_dt.strftime('%Y-%m-%d %I:%M %p')}")
+                    except:
+                        pass
     
     elif page == "❓ Help":
-        st.title("❓ Help & Instructions")
+        st.title("❓ Help")
         
         st.markdown("""
         ### 🎯 Getting Started
         
-        1. **Add Properties**: Use "Quick Add Property" in sidebar
-        2. **Monitor**: View properties on Dashboard
-        3. **Refresh**: Auto-refresh or manual refresh
+        1. **Add Properties**: Use Quick Add or Bulk Upload
+        2. **Monitor**: View on Dashboard
+        3. **Sync**: Connect Zoho CRM (optional)
         
-        ### 📝 Supported Inputs
+        ### 📤 Bulk Upload Methods
         
-        - **Full URL**: `https://www.utahrealestate.com/report/2053078`
-        - **MLS Number**: `2053078` or `MLS2053078`
+        **Text Input:**
+        - Paste multiple MLS numbers or URLs
+        - One per line
+        - Mix and match formats
         
-        ### 🌐 Supported Websites
+        **CSV Upload:**
+        - Upload a CSV file
+        - Looks for: `mls`, `url`, `link` columns
+        - Auto-detects property identifiers
         
-        - ✅ UtahRealEstate.com
-        - ✅ Zillow.com
+        ### 🔗 Zoho CRM Integration
+        
+        **What it does:**
+        - Syncs properties to Zoho CRM as Deals
+        - Maps all property fields automatically
+        - Updates existing records on re-sync
+        
+        **Field Mapping:**
+        - Deal Name → Address/MLS
+        - Stage → Property Status
+        - Amount → Price
+        - Custom Fields → Property details
         
         ### 💡 Tips
         
-        - **Card View**: Click property headers to expand/collapse
-        - **Table View**: See all properties at once
-        - **Auto-Refresh**: Set in Settings to refresh on app open
-        - **Manual Refresh**: Click 🔄 for instant updates
+        - Use CSV for large imports (100+ properties)
+        - Sync to Zoho after bulk uploads
+        - Export to CSV for backups
+        - Card view collapses show key info only
         
         ### 📱 Mobile
         
-        Works great on mobile! Add to home screen for app-like experience.
+        Fully responsive! Works on phones and tablets.
         """)
 
 if __name__ == "__main__":
